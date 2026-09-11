@@ -1,0 +1,6 @@
+# config.jsonc 是上游原样拷贝的文本协议文件，统一 LF。
+config.jsonc text eol=lf
+
+# HEVC-with-Alpha 产物是二进制，禁止行尾/编码转换，也不要在 diff 里展开。
+*.mov binary
+*.mov -diff

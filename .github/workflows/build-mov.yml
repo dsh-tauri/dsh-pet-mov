@@ -1,0 +1,149 @@
+# ==============================================================================
+# HEVC-with-Alpha .mov 素材流水线（macOS 桌宠专用）
+#
+# 背景（deepseek-harness-desktop issue #434）：
+#   macOS 的 WKWebView（WebKit）在解码 VP9-alpha WebM 时会直接丢弃 alpha 平面，
+#   透明区域被渲染成不透明的黑色矩形，且不触发任何 error 事件。Safari/WKWebView
+#   原生支持的透明视频格式是 HEVC-with-Alpha（AVVideoCodecType.hevcWithAlpha）。
+#
+# 本流水线把上游 PC2005-cloud/dsh-pet 的透明 VP9 WebM 批量转码为 .mov：
+#   ffmpeg 只负责解码（libvpx-vp9 保留 alpha）→ 原始 BGRA 帧 →
+#   swift hevc_alpha_encoder.swift（AVAssetWriter + hevcWithAlpha，苹果原生 API）。
+#   两个上游脚本均从被检出的上游仓库直接调用，不在本仓库重复维护。
+#
+# 触发：
+#   - workflow_dispatch：手动重编（可指定上游 ref / 提交）
+#   - schedule：每周跟随上游 main 重编（保持仓库新鲜）
+#   - repository_dispatch: dsh-pet-updated：上游素材更新时由外部触发
+#
+# 产物（直接提交回本仓库，供桌面端以 GitHub tarball 下载）：
+#   config.jsonc   上游 dsh-pet/assets/config.jsonc 原样拷贝
+#   mov/*.mov      HEVC-with-Alpha（hvc1）动画，文件名主名与上游 webm 一一对应
+#   本仓库不保留任何其它素材（fonts/pic/webm/preview 一律不落盘）。
+# ==============================================================================
+
+name: build-mov
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 上游 PC2005-cloud/dsh-pet 的 ref（留空 = 使用工作流内置的固定 ref）
+        required: false
+        type: string
+  schedule:
+    # 每周一 03:17 UTC（北京时间 11:17）跟随上游 main 重编一次。
+    - cron: '17 3 * * 1'
+  repository_dispatch:
+    types: [dsh-pet-updated]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mov
+  cancel-in-progress: false
+
+env:
+  # 素材源头。固定 ref 与桌面端 resources/preset-pets.json 保持一致；
+  # 换素材时同步更新这里与桌面端清单。
+  UPSTREAM_REPO: PC2005-cloud/dsh-pet
+  UPSTREAM_REF: e1ff8c1e4001878cbb80441262d530e16541f138
+
+jobs:
+  encode:
+    # HEVC-with-Alpha 编码（AVFoundation hevcWithAlpha）只能在 macOS 上跑。
+    runs-on: macos-14
+    timeout-minutes: 300
+    steps:
+      - name: Checkout dsh-pet-mov
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream ref
+        id: upstream
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.upstream_ref }}" ]; then
+            ref='${{ inputs.upstream_ref }}'
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            ref='main'
+          else
+            ref="$UPSTREAM_REF"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "upstream ref: $ref"
+
+      - name: Checkout upstream assets
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.upstream.outputs.ref }}
+          path: upstream
+          fetch-depth: 1
+          # 只取素材与编码脚本：上游仓库还有 Electron 运行时等大量无关文件。
+          sparse-checkout: |
+            dsh-pet/assets/webm
+            dsh-pet/assets/config.jsonc
+            scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Record upstream commit
+        id: revision
+        run: |
+          set -euo pipefail
+          sha=$(git -C upstream rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "upstream commit: $sha"
+
+      - name: Install ffmpeg
+        run: |
+          set -euo pipefail
+          brew install ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Encode HEVC-with-Alpha
+        run: |
+          set -euo pipefail
+          chmod +x upstream/scripts/encode_hevc_alpha.sh
+          rm -rf mov
+          mkdir -p mov
+          # 源 = 上游 dsh-pet/assets/webm；输出 = 本仓库 mov/
+          upstream/scripts/encode_hevc_alpha.sh upstream/dsh-pet/assets/webm mov
+          cp upstream/dsh-pet/assets/config.jsonc config.jsonc
+          echo "mov 数量: $(ls mov/*.mov | wc -l)"
+          echo "mov 体积: $(du -sh mov | cut -f1)"
+          test "$(ls mov/*.mov | wc -l)" -gt 0
+
+      - name: Verify alpha channel
+        run: |
+          set -euo pipefail
+          # 抽检前 5 个产物：alpha 必须真实存在（全是 255 = 编码丢 alpha）。
+          python3 upstream/scripts/check_alpha.py $(ls mov/*.mov | head -n 5)
+          for f in $(ls mov/*.mov | head -n 2); do
+            echo "=== $(basename "$f") ==="
+            ffprobe -v error -select_streams v:0 \
+              -show_entries stream=codec_tag_string,codec_name,width,height,r_frame_rate \
+              -of csv=p=0 "$f"
+          done
+
+      - name: Commit and push assets
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A config.jsonc mov
+          if git diff --cached --quiet; then
+            echo "素材无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: rebuild HEVC-alpha mov assets from ${UPSTREAM_REPO}@${{ steps.revision.outputs.sha }}"
+          git push
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-pet-mov-hevc-alpha
+          path: |
+            config.jsonc
+            mov/*.mov
+          if-no-files-found: error

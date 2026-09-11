@@ -1,0 +1,6 @@
+# 上游检出目录（CI 临时目录，仅用于取素材）
+/upstream/
+
+# CI 临时文件
+*.rgba
+*.tmp.mov
